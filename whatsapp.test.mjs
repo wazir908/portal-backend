@@ -1,0 +1,36 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import { setTimeout as delay } from 'node:timers/promises';
+import { createWhatsApp } from './whatsapp.mjs';
+
+test('QR linking, cancellation and restart do not replay uncertain messages', async () => {
+  const ev = new EventEmitter();
+  const sent = [], logs = [];
+  let saved;
+  const store = { latestBatch: () => saved || null, auth: () => ({ state: {}, saveCreds: async () => {} }), saveBatch: batch => { saved = structuredClone(batch); }, log: item => logs.push(item), clearAuth() {} };
+  const client = { ev, user: { name: 'Test', id: '923001234567:1@s.whatsapp.net' }, sendMessage: async (jid, text) => { sent.push({ jid, text }); return { key: { id: 'msg' } }; }, end() {} };
+  const wa = createWhatsApp(store, 30, () => client);
+  await wa.connect();
+  ev.emit('connection.update', { qr: 'test-linking-code' });
+  for (let i = 0; i < 50 && wa.snapshot().connection.state !== 'qr'; i++) await delay(10);
+  assert.match(wa.snapshot().connection.qrDataUrl, /^data:image\/png;base64,/);
+  ev.emit('connection.update', { connection: 'open' });
+  assert.equal(wa.snapshot().connection.state, 'ready');
+  wa.send([{ phone: '03001234567', message: 'First' }, { phone: '03001234568', message: 'Second' }]);
+  for (let i = 0; i < 50 && sent.length === 0; i++) await delay(2);
+  wa.cancel();
+  assert.throws(() => wa.send([{ phone: '03001234567', message: 'Duplicate' }]), /already running/);
+  await delay(70);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].jid, '923001234567@s.whatsapp.net');
+  assert.equal(logs[0].status, 'sent');
+  assert.equal(wa.snapshot().batch.items[1].status, 'cancelled');
+  wa.shutdown();
+  saved = { id: 'interrupted', state: 'sending', items: [{ status: 'sending' }, { status: 'queued' }] };
+  const restored = createWhatsApp(store, 1, () => client);
+  assert.equal(restored.snapshot().batch.state, 'cancelled');
+  assert.match(restored.snapshot().batch.items[0].error, /check WhatsApp/);
+  assert.equal(sent.length, 1);
+  restored.shutdown();
+});
